@@ -476,8 +476,9 @@ fn main() -> anyhow::Result<()> {
                             bytemuck::bytes_of(&CubePushConstants {
                                 perspective_view_matrix,
                                 cube_transform: Mat4::from_translation(Vec3::new(0.0, 0.0, 0.25))
-                                    * Mat4::from_scale(0.2)
-                                    * Mat4::from_rotation_y(cube_rotation),
+                                    * Mat4::from_rotation_y(cube_rotation)
+                                    * Mat4::from_rotation_z(cube_rotation * 0.5)
+                                    * Mat4::from_scale(0.2),
                             }),
                         );
                         device.cmd_draw_indexed(command_buffer, num_indices, 1, 0, 0, 0);
@@ -830,13 +831,12 @@ fn cube_verts() -> ([Vertex; 8], [u16; 36]) {
             vertex(1.0, 1.0, 1.0),
         ],
         [
-            // bottom
-            0, 1, 2, 1, 2, 3, // front
-            1, 3, 5, 3, 5, 7, // back
-            0, 2, 4, 2, 4, 6, // left
-            0, 1, 4, 1, 4, 5, // right
-            2, 3, 6, 3, 6, 7, // top
-            4, 5, 6, 5, 6, 7,
+            0, 1, 2, 2, 1, 3, // bottom
+            3, 1, 5, 3, 5, 7, // front
+            0, 2, 4, 4, 2, 6, // back
+            1, 0, 4, 1, 4, 5, // left
+            2, 3, 6, 6, 3, 7, // right
+            5, 4, 6, 5, 6, 7, // top
         ],
     )
 }
@@ -886,6 +886,11 @@ impl Pipelines {
 
         let rasterizer = vk::PipelineRasterizationStateCreateInfo::builder()
             .polygon_mode(vk::PolygonMode::FILL)
+            .line_width(1.0);
+
+        let cull_rasterizer = vk::PipelineRasterizationStateCreateInfo::builder()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::BACK)
             .line_width(1.0);
 
         let triangle_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
@@ -981,7 +986,7 @@ impl Pipelines {
             .vertex_input_state(&cube_vertex_input)
             .input_assembly_state(&triangle_assembly)
             .viewport_state(&viewport_state)
-            .rasterization_state(&rasterizer)
+            .rasterization_state(&cull_rasterizer)
             .multisample_state(&multisampling)
             .color_blend_state(&color_blending)
             .dynamic_state(&dynamic_state)
