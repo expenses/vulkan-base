@@ -275,7 +275,7 @@ fn main() -> anyhow::Result<()> {
         .command_buffer_count(swapchain.framebuffers.len() as _);
     let cmd_bufs = unsafe { device.allocate_command_buffers(&cmd_buf_allocate_info) }?;
 
-    let mut syncronisation_ = Syncronisation::new(&device, swapchain.framebuffers.len());
+    let mut syncronisation = Syncronisation::new(&device, swapchain.framebuffers.len());
 
     let view_matrix = Mat4::look_at(Vec3::new(-1.0, 0.0, 0.0), Vec3::zero(), Vec3::unit_y());
 
@@ -336,7 +336,7 @@ fn main() -> anyhow::Result<()> {
         Event::MainEventsCleared => {
             unsafe {
                 device
-                    .wait_for_fences(&[syncronisation_.in_flight_fences[frame]], true, u64::MAX)
+                    .wait_for_fences(&[syncronisation.in_flight_fences[frame]], true, u64::MAX)
                     .unwrap();
             }
 
@@ -344,12 +344,12 @@ fn main() -> anyhow::Result<()> {
                 swapchain.swapchain_loader.acquire_next_image(
                     swapchain.swapchain,
                     u64::MAX,
-                    syncronisation_.image_available_semaphores[frame],
+                    syncronisation.image_available_semaphores[frame],
                     vk::Fence::null(),
                 )
             } {
                 Ok((image_index, _suboptimal)) => {
-                    syncronisation_.wait_fences(&device, image_index as usize, frame);
+                    syncronisation.wait_fences(&device, image_index as usize, frame);
 
                     let command_buffer = cmd_bufs[image_index as usize];
                     let framebuffer = swapchain.framebuffers[image_index as usize];
@@ -402,9 +402,9 @@ fn main() -> anyhow::Result<()> {
                         device.end_command_buffer(command_buffer).unwrap();
                     }
 
-                    let wait_semaphores = [syncronisation_.image_available_semaphores[frame]];
+                    let wait_semaphores = [syncronisation.image_available_semaphores[frame]];
                     let command_buffers = [command_buffer];
-                    let signal_semaphores = [syncronisation_.render_finished_semaphores[frame]];
+                    let signal_semaphores = [syncronisation.render_finished_semaphores[frame]];
                     let submit_info = vk::SubmitInfo::builder()
                         .wait_semaphores(&wait_semaphores)
                         .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
@@ -412,7 +412,7 @@ fn main() -> anyhow::Result<()> {
                         .signal_semaphores(&signal_semaphores);
 
                     unsafe {
-                        let in_flight_fence = syncronisation_.in_flight_fences[frame];
+                        let in_flight_fence = syncronisation.in_flight_fences[frame];
                         device.reset_fences(&[in_flight_fence]).unwrap();
                         device
                             .queue_submit(queue, &[*submit_info], in_flight_fence)
@@ -444,7 +444,7 @@ fn main() -> anyhow::Result<()> {
         Event::LoopDestroyed => unsafe {
             device.device_wait_idle().unwrap();
 
-            syncronisation_.cleanup(&device);
+            syncronisation.cleanup(&device);
 
             device.destroy_command_pool(command_pool, None);
 
@@ -602,6 +602,13 @@ impl Syncronisation {
 
 #[derive(Copy, Clone, bytemuck::Zeroable, bytemuck::Pod, Debug)]
 #[repr(C)]
+struct CubePushConstants {
+    perspective_view: Mat4,
+    cube_transform: Mat4,
+}
+
+#[derive(Copy, Clone, bytemuck::Zeroable, bytemuck::Pod, Debug)]
+#[repr(C)]
 struct Vertex {
     position: Vec3,
     colour: Vec3,
@@ -628,7 +635,7 @@ impl Pipelines {
                 &vk::PipelineLayoutCreateInfo::builder().push_constant_ranges(&[
                     *vk::PushConstantRange::builder()
                         .stage_flags(vk::ShaderStageFlags::VERTEX)
-                        .size(std::mem::size_of::<[Mat4; 2]>() as u32),
+                        .size(std::mem::size_of::<CubePushConstants>() as u32),
                 ]),
                 None,
             )
