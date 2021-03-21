@@ -1,5 +1,5 @@
 [package]
-name = "vulkan-triangle"
+name = "vulkan-base"
 version = "0.1.0"
 authors = ["Ashley Ruglys <ashley.ruglys@gmail.com>"]
 edition = "2018"

@@ -33,14 +33,14 @@ unsafe extern "system" fn vulkan_debug_utils_callback(
 fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
-        .with_title("Vulkan examples")
+        .with_title("Vulkan base")
         .build(&event_loop)?;
 
     let entry = unsafe { ash::Entry::new() }?;
 
     // https://vulkan-tutorial.com/Drawing_a_triangle/Setup/Instance
     let app_info = vk::ApplicationInfo::builder()
-        .application_name(&c_str!("Vulkan examples"))
+        .application_name(&c_str!("Vulkan base"))
         .application_version(vk::make_version(1, 0, 0))
         .engine_version(vk::make_version(1, 0, 0))
         .api_version(vk::make_version(1, 0, 0));

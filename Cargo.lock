@@ -949,7 +949,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vulkan-triangle"
+name = "vulkan-base"
 version = "0.1.0"
 dependencies = [
  "anyhow",
