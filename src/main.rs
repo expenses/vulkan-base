@@ -75,11 +75,10 @@ fn main() -> anyhow::Result<()> {
         .collect::<Vec<_>>();
 
     let mut debug_messenger_info = vk::DebugUtilsMessengerCreateInfoEXT::builder()
-        .message_severity(
-            vk::DebugUtilsMessageSeverityFlagsEXT::all()
-                ^ vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE,
+        .message_severity(vk::DebugUtilsMessageSeverityFlagsEXT::all())
+        .message_type(
+            vk::DebugUtilsMessageTypeFlagsEXT::all() ^ vk::DebugUtilsMessageTypeFlagsEXT::GENERAL,
         )
-        .message_type(vk::DebugUtilsMessageTypeFlagsEXT::all())
         .pfn_user_callback(Some(vulkan_debug_utils_callback));
 
     let instance_info = vk::InstanceCreateInfo::builder()
@@ -99,7 +98,7 @@ fn main() -> anyhow::Result<()> {
     let surface = unsafe { ash_window::create_surface(&entry, &instance, &window, None) }?;
 
     // https://vulkan-tutorial.com/Drawing_a_triangle/Setup/Physical_devices_and_queue_families
-    let (physical_device, queue_family, format, present_mode, device_properties) =
+    let (physical_device, queue_family, format, device_properties) =
         unsafe { instance.enumerate_physical_devices() }?
             .into_iter()
             .filter_map(|physical_device| unsafe {
@@ -138,13 +137,6 @@ fn main() -> anyhow::Result<()> {
                     None => return None,
                 };
 
-                let present_mode = surface_loader
-                    .get_physical_device_surface_present_modes(physical_device, surface)
-                    .unwrap()
-                    .into_iter()
-                    .find(|present_mode| present_mode == &vk::PresentModeKHR::MAILBOX)
-                    .unwrap_or(vk::PresentModeKHR::FIFO);
-
                 let supported_device_extensions = instance
                     .enumerate_device_extension_properties(physical_device)
                     .unwrap();
@@ -157,15 +149,9 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 let device_properties = instance.get_physical_device_properties(physical_device);
-                Some((
-                    physical_device,
-                    queue_family,
-                    format,
-                    present_mode,
-                    device_properties,
-                ))
+                Some((physical_device, queue_family, format, device_properties))
             })
-            .max_by_key(|(_, _, _, _, properties)| match properties.device_type {
+            .max_by_key(|(.., properties)| match properties.device_type {
                 vk::PhysicalDeviceType::DISCRETE_GPU => 2,
                 vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
                 _ => 0,
@@ -191,23 +177,63 @@ fn main() -> anyhow::Result<()> {
     let device = unsafe { instance.create_device(physical_device, &device_info, None) }?;
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
+    let mut allocator = vk_mem::Allocator::new(&vk_mem::AllocatorCreateInfo {
+        device: device.clone(),
+        physical_device,
+        instance: instance.clone(),
+        // Defaults
+        flags: vk_mem::AllocatorCreateFlags::NONE,
+        preferred_large_heap_block_size: 0,
+        frame_in_use_count: 0,
+        heap_size_limits: None,
+    })?;
+
+    let (verts, indices) = cube_verts();
+
+    let vertex_buffer = Buffer::new(
+        bytemuck::cast_slice(&verts),
+        vk::BufferUsageFlags::VERTEX_BUFFER,
+        &allocator,
+        queue_family,
+    )?;
+
+    let index_buffer = Buffer::new(
+        bytemuck::cast_slice(&indices),
+        vk::BufferUsageFlags::INDEX_BUFFER,
+        &allocator,
+        queue_family,
+    )?;
+
+    let num_indices = indices.len() as u32;
+
     // https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Render_passes
-    let attachments = [*vk::AttachmentDescription::builder()
-        .format(format.format)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+    let attachments = [
+        *vk::AttachmentDescription::builder()
+            .format(format.format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+        *vk::AttachmentDescription::builder()
+            .format(vk::Format::D32_SFLOAT)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+    ];
 
     let color_attachment_refs = [*vk::AttachmentReference::builder()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+
+    let depth_attachment_ref = *vk::AttachmentReference::builder()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
     let subpasses = [*vk::SubpassDescription::builder()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_attachment_refs)];
+        .color_attachments(&color_attachment_refs)
+        .depth_stencil_attachment(&depth_attachment_ref)];
     let dependencies = [*vk::SubpassDependency::builder()
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
@@ -240,6 +266,8 @@ fn main() -> anyhow::Result<()> {
         height: window_size.height,
     };
 
+    let mut depth_buffer = DepthBuffer::new(extent.width, extent.height, &device, &allocator)?;
+
     let mut swapchain_info = *vk::SwapchainCreateInfoKHR::builder()
         .surface(surface)
         .min_image_count(image_count)
@@ -251,7 +279,7 @@ fn main() -> anyhow::Result<()> {
         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
         .pre_transform(surface_caps.current_transform)
         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-        .present_mode(present_mode)
+        .present_mode(vk::PresentModeKHR::FIFO)
         .clipped(true)
         .old_swapchain(vk::SwapchainKHR::null());
 
@@ -261,6 +289,7 @@ fn main() -> anyhow::Result<()> {
         &device,
         swapchain_info,
         render_pass,
+        depth_buffer.view,
     )?;
 
     // https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Command_buffers
@@ -279,13 +308,14 @@ fn main() -> anyhow::Result<()> {
 
     let view_matrix = Mat4::look_at(Vec3::new(-1.0, 0.0, 0.0), Vec3::zero(), Vec3::unit_y());
 
-    let mut perspective_matrix = ultraviolet::projection::perspective_infinite_z_vk(
+    let perspective_matrix = ultraviolet::projection::perspective_infinite_z_vk(
         59.0_f32.to_radians(),
         extent.width as f32 / extent.height as f32,
         0.1,
     );
 
-    let mut perspective_view_matrix = view_matrix * perspective_matrix;
+    let mut perspective_view_matrix = perspective_matrix * view_matrix;
+    let mut cube_rotation = 0.0;
 
     let mut frame = 0;
     event_loop.run(move |event, _, control_flow| match event {
@@ -298,14 +328,23 @@ fn main() -> anyhow::Result<()> {
                 extent.width = size.width as u32;
                 extent.height = size.height as u32;
 
-                perspective_matrix = ultraviolet::projection::perspective_infinite_z_vk(
+                let perspective_matrix = ultraviolet::projection::perspective_infinite_z_vk(
                     59.0_f32.to_radians(),
                     extent.width as f32 / extent.height as f32,
                     0.1,
                 );
-                perspective_view_matrix = view_matrix * perspective_matrix;
+                perspective_view_matrix = perspective_matrix * view_matrix;
 
                 swapchain_info.image_extent = extent;
+
+                unsafe {
+                    device.device_wait_idle().unwrap();
+                }
+
+                depth_buffer.cleanup(&device, &allocator).unwrap();
+
+                depth_buffer =
+                    DepthBuffer::new(extent.width, extent.height, &device, &allocator).unwrap();
 
                 unsafe {
                     swapchain.cleanup(&device);
@@ -315,6 +354,7 @@ fn main() -> anyhow::Result<()> {
                     &device,
                     swapchain_info,
                     render_pass,
+                    depth_buffer.view,
                 )
                 .unwrap();
             }
@@ -334,6 +374,8 @@ fn main() -> anyhow::Result<()> {
             _ => (),
         },
         Event::MainEventsCleared => {
+            cube_rotation += 0.01;
+
             unsafe {
                 device
                     .wait_for_fences(&[syncronisation.in_flight_fences[frame]], true, u64::MAX)
@@ -358,11 +400,19 @@ fn main() -> anyhow::Result<()> {
                     unsafe { device.begin_command_buffer(command_buffer, &cmd_buf_begin_info) }
                         .unwrap();
 
-                    let clear_values = [vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.0, 0.0, 0.0, 1.0],
+                    let clear_values = [
+                        vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [0.0, 0.0, 0.0, 1.0],
+                            },
                         },
-                    }];
+                        vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: 1.0,
+                                stencil: 0,
+                            },
+                        },
+                    ];
                     let area = vk::Rect2D {
                         offset: vk::Offset2D { x: 0, y: 0 },
                         extent,
@@ -397,6 +447,39 @@ fn main() -> anyhow::Result<()> {
                             pipelines.triangle_pipeline,
                         );
                         device.cmd_draw(command_buffer, 3, 1, 0, 0);
+
+                        device.cmd_bind_pipeline(
+                            command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            pipelines.cube_pipeline,
+                        );
+                        device.cmd_push_constants(
+                            command_buffer,
+                            pipelines.push_constants_pipeline_layout,
+                            vk::ShaderStageFlags::VERTEX,
+                            0,
+                            bytemuck::bytes_of(&CubePushConstants {
+                                perspective_view_matrix,
+                                cube_transform: Mat4::from_translation(Vec3::new(0.0, 0.0, 0.25))
+                                    * Mat4::from_scale(0.2)
+                                    * Mat4::from_rotation_y(cube_rotation),
+                            }),
+                        );
+
+                        device.cmd_bind_vertex_buffers(
+                            command_buffer,
+                            0,
+                            &[vertex_buffer.buffer],
+                            &[0],
+                        );
+                        device.cmd_bind_index_buffer(
+                            command_buffer,
+                            index_buffer.buffer,
+                            0,
+                            vk::IndexType::UINT16,
+                        );
+                        device.cmd_draw_indexed(command_buffer, num_indices, 1, 0, 0, 0);
+
                         device.cmd_end_render_pass(command_buffer);
 
                         device.end_command_buffer(command_buffer).unwrap();
@@ -445,6 +528,9 @@ fn main() -> anyhow::Result<()> {
             device.device_wait_idle().unwrap();
 
             syncronisation.cleanup(&device);
+            depth_buffer.cleanup(&device, &allocator).unwrap();
+            vertex_buffer.cleanup(&allocator).unwrap();
+            index_buffer.cleanup(&allocator).unwrap();
 
             device.destroy_command_pool(command_pool, None);
 
@@ -458,6 +544,8 @@ fn main() -> anyhow::Result<()> {
 
             debug_utils_loader.destroy_debug_utils_messenger(debug_messenger, None);
 
+            allocator.destroy();
+
             device.destroy_device(None);
 
             instance.destroy_instance(None);
@@ -465,6 +553,117 @@ fn main() -> anyhow::Result<()> {
         },
         _ => (),
     })
+}
+
+struct DepthBuffer {
+    image: vk::Image,
+    allocation: vk_mem::Allocation,
+    view: vk::ImageView,
+}
+
+impl DepthBuffer {
+    fn new(
+        width: u32,
+        height: u32,
+        device: &Device,
+        allocator: &vk_mem::Allocator,
+    ) -> anyhow::Result<Self> {
+        let (image, allocation, _allocation_info) = allocator
+            .create_image(
+                &vk::ImageCreateInfo::builder()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(vk::Format::D32_SFLOAT)
+                    .extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
+                &vk_mem::AllocationCreateInfo {
+                    usage: vk_mem::MemoryUsage::GpuOnly,
+                    flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
+                    ..Default::default()
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("{:?}", err))?;
+
+        let view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::builder()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::D32_SFLOAT)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::builder()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .level_count(1)
+                            .layer_count(1)
+                            .build(),
+                    ),
+                None,
+            )
+        }?;
+
+        Ok(Self {
+            image,
+            allocation,
+            view,
+        })
+    }
+
+    fn cleanup(&self, device: &Device, allocator: &vk_mem::Allocator) -> anyhow::Result<()> {
+        unsafe {
+            device.destroy_image_view(self.view, None);
+        }
+
+        allocator
+            .destroy_image(self.image, &self.allocation)
+            .map_err(|err| err.into())
+    }
+}
+
+struct Buffer {
+    buffer: vk::Buffer,
+    allocation: vk_mem::Allocation,
+}
+
+impl Buffer {
+    fn new(
+        bytes: &[u8],
+        usage: vk::BufferUsageFlags,
+        allocator: &vk_mem::Allocator,
+        queue_family: u32,
+    ) -> anyhow::Result<Self> {
+        let (buffer, allocation, _allocation_info) = allocator.create_buffer(
+            &vk::BufferCreateInfo::builder()
+                .size(bytes.len() as u64)
+                .usage(usage)
+                .queue_family_indices(&[queue_family]),
+            &vk_mem::AllocationCreateInfo {
+                usage: vk_mem::MemoryUsage::GpuOnly,
+                ..Default::default()
+            },
+        )?;
+
+        let pointer = allocator.map_memory(&allocation)?;
+
+        let slice = unsafe { std::slice::from_raw_parts_mut(pointer, bytes.len()) };
+
+        slice.copy_from_slice(bytes);
+
+        allocator.unmap_memory(&allocation)?;
+
+        Ok(Self { buffer, allocation })
+    }
+
+    fn cleanup(&self, allocator: &vk_mem::Allocator) -> anyhow::Result<()> {
+        allocator
+            .destroy_buffer(self.buffer, &self.allocation)
+            .map_err(|err| err.into())
+    }
 }
 
 struct Swapchain {
@@ -481,6 +680,7 @@ impl Swapchain {
         device: &Device,
         info: vk::SwapchainCreateInfoKHR,
         render_pass: vk::RenderPass,
+        depth_image_view: vk::ImageView,
     ) -> anyhow::Result<Self> {
         let swapchain = unsafe { swapchain_loader.create_swapchain(&info, None) }.unwrap();
         let images = unsafe { swapchain_loader.get_swapchain_images(swapchain) }.unwrap();
@@ -492,18 +692,10 @@ impl Swapchain {
                     .image(*swapchain_image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(info.image_format)
-                    .components(vk::ComponentMapping {
-                        r: vk::ComponentSwizzle::IDENTITY,
-                        g: vk::ComponentSwizzle::IDENTITY,
-                        b: vk::ComponentSwizzle::IDENTITY,
-                        a: vk::ComponentSwizzle::IDENTITY,
-                    })
                     .subresource_range(
                         vk::ImageSubresourceRange::builder()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
                             .level_count(1)
-                            .base_array_layer(0)
                             .layer_count(1)
                             .build(),
                     );
@@ -514,7 +706,7 @@ impl Swapchain {
         let framebuffers = image_views
             .iter()
             .map(|image_view| {
-                let attachments = [*image_view];
+                let attachments = [*image_view, depth_image_view];
                 let framebuffer_info = vk::FramebufferCreateInfo::builder()
                     .render_pass(render_pass)
                     .attachments(&attachments)
@@ -536,8 +728,6 @@ impl Swapchain {
     }
 
     unsafe fn cleanup(&self, device: &Device) {
-        device.device_wait_idle().unwrap();
-
         for &framebuffer in &self.framebuffers {
             device.destroy_framebuffer(framebuffer, None);
         }
@@ -603,7 +793,7 @@ impl Syncronisation {
 #[derive(Copy, Clone, bytemuck::Zeroable, bytemuck::Pod, Debug)]
 #[repr(C)]
 struct CubePushConstants {
-    perspective_view: Mat4,
+    perspective_view_matrix: Mat4,
     cube_transform: Mat4,
 }
 
@@ -614,9 +804,43 @@ struct Vertex {
     colour: Vec3,
 }
 
+fn vertex(x: f32, z: f32, y: f32) -> Vertex {
+    let corner = Vec3::new(x, y, z);
+
+    Vertex {
+        position: corner * 2.0 - Vec3::broadcast(1.0),
+        colour: corner,
+    }
+}
+
+fn cube_verts() -> ([Vertex; 8], [u16; 36]) {
+    (
+        [
+            vertex(0.0, 0.0, 0.0),
+            vertex(1.0, 0.0, 0.0),
+            vertex(0.0, 1.0, 0.0),
+            vertex(1.0, 1.0, 0.0),
+            vertex(0.0, 0.0, 1.0),
+            vertex(1.0, 0.0, 1.0),
+            vertex(0.0, 1.0, 1.0),
+            vertex(1.0, 1.0, 1.0),
+        ],
+        [
+            // bottom
+            0, 1, 2, 1, 2, 3, // front
+            1, 3, 5, 3, 5, 7, // back
+            0, 2, 4, 2, 4, 6, // left
+            0, 1, 4, 1, 4, 5, // right
+            2, 3, 6, 3, 6, 7, // top
+            4, 5, 6, 5, 6, 7,
+        ],
+    )
+}
+
 struct Pipelines {
     triangle_pipeline: vk::Pipeline,
     cube_pipeline: vk::Pipeline,
+    push_constants_pipeline_layout: vk::PipelineLayout,
 }
 
 impl Pipelines {
@@ -625,12 +849,7 @@ impl Pipelines {
             device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::builder().build(), None)?
         };
 
-        let triangle_pipeline_layout = unsafe {
-            device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder(), None)
-        }
-        .unwrap();
-
-        let cube_pipeline_layout = unsafe {
+        let push_constants_pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::builder().push_constant_ranges(&[
                     *vk::PushConstantRange::builder()
@@ -667,6 +886,11 @@ impl Pipelines {
 
         let triangle_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::builder()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS);
 
         let empty_vertex_input = vk::PipelineVertexInputStateCreateInfo::builder();
 
@@ -705,12 +929,12 @@ impl Pipelines {
         let vs_cube = vk::ShaderModuleCreateInfo::builder().code(&vs_cube);
         let vs_cube = unsafe { device.create_shader_module(&vs_cube, None) }.unwrap();
 
-        let shader_frag = util::read_spv(&mut std::io::Cursor::new(include_bytes!(
+        let fs_colour = util::read_spv(&mut std::io::Cursor::new(include_bytes!(
             "../shaders/compiled/colour.frag.spv"
         )))
         .unwrap();
-        let shader_frag = vk::ShaderModuleCreateInfo::builder().code(&shader_frag);
-        let shader_frag = unsafe { device.create_shader_module(&shader_frag, None) }.unwrap();
+        let fs_colour = vk::ShaderModuleCreateInfo::builder().code(&fs_colour);
+        let fs_colour = unsafe { device.create_shader_module(&fs_colour, None) }.unwrap();
 
         let triangle_pipeline_stages = [
             *vk::PipelineShaderStageCreateInfo::builder()
@@ -719,7 +943,7 @@ impl Pipelines {
                 .name(&c_str!("main")),
             *vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(shader_frag)
+                .module(fs_colour)
                 .name(&c_str!("main")),
         ];
 
@@ -732,7 +956,8 @@ impl Pipelines {
             .multisample_state(&multisampling)
             .color_blend_state(&color_blending)
             .dynamic_state(&dynamic_state)
-            .layout(triangle_pipeline_layout)
+            .depth_stencil_state(&depth_stencil)
+            .layout(push_constants_pipeline_layout)
             .render_pass(render_pass)
             .subpass(0);
 
@@ -743,7 +968,7 @@ impl Pipelines {
                 .name(&c_str!("main")),
             *vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(shader_frag)
+                .module(fs_colour)
                 .name(&c_str!("main")),
         ];
 
@@ -756,7 +981,8 @@ impl Pipelines {
             .multisample_state(&multisampling)
             .color_blend_state(&color_blending)
             .dynamic_state(&dynamic_state)
-            .layout(cube_pipeline_layout)
+            .depth_stencil_state(&depth_stencil)
+            .layout(push_constants_pipeline_layout)
             .render_pass(render_pass)
             .subpass(0);
 
@@ -772,21 +998,21 @@ impl Pipelines {
         let pipelines = Self {
             triangle_pipeline: pipelines[0],
             cube_pipeline: pipelines[1],
+            push_constants_pipeline_layout,
         };
 
         unsafe {
             device.destroy_pipeline_cache(pipeline_cache, None);
-            device.destroy_pipeline_layout(triangle_pipeline_layout, None);
-            device.destroy_pipeline_layout(cube_pipeline_layout, None);
             device.destroy_shader_module(vs_triangle, None);
             device.destroy_shader_module(vs_cube, None);
-            device.destroy_shader_module(shader_frag, None);
+            device.destroy_shader_module(fs_colour, None);
         }
 
         Ok(pipelines)
     }
 
     unsafe fn cleanup(&self, device: &Device) {
+        device.destroy_pipeline_layout(self.push_constants_pipeline_layout, None);
         device.destroy_pipeline(self.triangle_pipeline, None);
         device.destroy_pipeline(self.cube_pipeline, None);
     }

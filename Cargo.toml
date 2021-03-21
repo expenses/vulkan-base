@@ -13,4 +13,5 @@ ash-window = "0.6.0"
 byte-strings = "0.1.3"
 bytemuck = { version = "1.5.1", features = ["derive"] }
 ultraviolet = { version = "0.8.0", features = ["bytemuck"] }
+vk-mem = "0.2.2"
 winit = "0.24.0"
