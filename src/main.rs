@@ -456,19 +456,6 @@ fn main() -> anyhow::Result<()> {
                             vk::PipelineBindPoint::GRAPHICS,
                             pipelines.cube_pipeline,
                         );
-                        device.cmd_push_constants(
-                            command_buffer,
-                            pipelines.push_constants_pipeline_layout,
-                            vk::ShaderStageFlags::VERTEX,
-                            0,
-                            bytemuck::bytes_of(&CubePushConstants {
-                                perspective_view_matrix,
-                                cube_transform: Mat4::from_translation(Vec3::new(0.0, 0.0, 0.25))
-                                    * Mat4::from_scale(0.2)
-                                    * Mat4::from_rotation_y(cube_rotation),
-                            }),
-                        );
-
                         device.cmd_bind_vertex_buffers(
                             command_buffer,
                             0,
@@ -480,6 +467,18 @@ fn main() -> anyhow::Result<()> {
                             index_buffer.buffer,
                             0,
                             vk::IndexType::UINT16,
+                        );
+                        device.cmd_push_constants(
+                            command_buffer,
+                            pipelines.push_constants_pipeline_layout,
+                            vk::ShaderStageFlags::VERTEX,
+                            0,
+                            bytemuck::bytes_of(&CubePushConstants {
+                                perspective_view_matrix,
+                                cube_transform: Mat4::from_translation(Vec3::new(0.0, 0.0, 0.25))
+                                    * Mat4::from_scale(0.2)
+                                    * Mat4::from_rotation_y(cube_rotation),
+                            }),
                         );
                         device.cmd_draw_indexed(command_buffer, num_indices, 1, 0, 0, 0);
 
