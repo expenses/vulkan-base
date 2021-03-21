@@ -15,8 +15,6 @@ use winit::{
     window::WindowBuilder,
 };
 
-const FRAMES_IN_FLIGHT: usize = 2;
-
 unsafe extern "system" fn vulkan_debug_utils_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     message_type: vk::DebugUtilsMessageTypeFlagsEXT,
@@ -304,10 +302,10 @@ fn main() -> anyhow::Result<()> {
     let cmd_buf_allocate_info = vk::CommandBufferAllocateInfo::builder()
         .command_pool(command_pool)
         .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(swapchain.framebuffers.len() as _);
-    let cmd_bufs = unsafe { device.allocate_command_buffers(&cmd_buf_allocate_info) }?;
+        .command_buffer_count(1);
+    let command_buffer = unsafe { device.allocate_command_buffers(&cmd_buf_allocate_info) }?[0];
 
-    let mut syncronisation = Syncronisation::new(&device, swapchain.framebuffers.len());
+    let syncronisation = Syncronisation::new(&device);
 
     let view_matrix = Mat4::look_at(Vec3::new(-1.0, 0.0, 0.0), Vec3::zero(), Vec3::unit_y());
 
@@ -320,7 +318,6 @@ fn main() -> anyhow::Result<()> {
     let mut perspective_view_matrix = perspective_matrix * view_matrix;
     let mut cube_rotation = 0.0;
 
-    let mut frame = 0;
     event_loop.run(move |event, _, control_flow| match event {
         Event::NewEvents(StartCause::Init) => {
             *control_flow = ControlFlow::Poll;
@@ -379,29 +376,29 @@ fn main() -> anyhow::Result<()> {
         Event::MainEventsCleared => {
             cube_rotation += 0.01;
 
-            unsafe {
-                device
-                    .wait_for_fences(&[syncronisation.in_flight_fences[frame]], true, u64::MAX)
-                    .unwrap();
-            }
-
             match unsafe {
                 swapchain.swapchain_loader.acquire_next_image(
                     swapchain.swapchain,
                     u64::MAX,
-                    syncronisation.image_available_semaphores[frame],
+                    syncronisation.present_complete_semaphore,
                     vk::Fence::null(),
                 )
             } {
                 Ok((image_index, _suboptimal)) => {
-                    syncronisation.wait_fences(&device, image_index as usize, frame);
-
-                    let command_buffer = cmd_bufs[image_index as usize];
                     let framebuffer = swapchain.framebuffers[image_index as usize];
 
-                    let cmd_buf_begin_info = vk::CommandBufferBeginInfo::builder();
-                    unsafe { device.begin_command_buffer(command_buffer, &cmd_buf_begin_info) }
-                        .unwrap();
+                    unsafe {
+                        device
+                            .wait_for_fences(&[syncronisation.draw_commands_fence], true, u64::MAX)
+                            .unwrap();
+
+                        device
+                            .reset_fences(&[syncronisation.draw_commands_fence])
+                            .unwrap();
+                    }
+
+                    let cmd_buf_begin_info = vk::CommandBufferBeginInfo::builder()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
                     let clear_values = [
                         vk::ClearValue {
@@ -435,6 +432,10 @@ fn main() -> anyhow::Result<()> {
                         .max_depth(1.0);
 
                     unsafe {
+                        device
+                            .begin_command_buffer(command_buffer, &cmd_buf_begin_info)
+                            .unwrap();
+
                         device.cmd_set_viewport(command_buffer, 0, &[viewport]);
                         device.cmd_set_scissor(command_buffer, 0, &[area]);
 
@@ -488,9 +489,9 @@ fn main() -> anyhow::Result<()> {
                         device.end_command_buffer(command_buffer).unwrap();
                     }
 
-                    let wait_semaphores = [syncronisation.image_available_semaphores[frame]];
+                    let wait_semaphores = [syncronisation.present_complete_semaphore];
                     let command_buffers = [command_buffer];
-                    let signal_semaphores = [syncronisation.render_finished_semaphores[frame]];
+                    let signal_semaphores = [syncronisation.rendering_complete_semaphore];
                     let submit_info = vk::SubmitInfo::builder()
                         .wait_semaphores(&wait_semaphores)
                         .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
@@ -498,17 +499,20 @@ fn main() -> anyhow::Result<()> {
                         .signal_semaphores(&signal_semaphores);
 
                     unsafe {
-                        let in_flight_fence = syncronisation.in_flight_fences[frame];
-                        device.reset_fences(&[in_flight_fence]).unwrap();
                         device
-                            .queue_submit(queue, &[*submit_info], in_flight_fence)
-                            .unwrap()
+                            .queue_submit(
+                                queue,
+                                &[*submit_info],
+                                syncronisation.draw_commands_fence,
+                            )
+                            .unwrap();
                     }
 
-                    let swapchains = [swapchain.swapchain];
+                    let wait_semaphors = [syncronisation.rendering_complete_semaphore];
                     let image_indices = [image_index];
+                    let swapchains = [swapchain.swapchain];
                     let present_info = vk::PresentInfoKHR::builder()
-                        .wait_semaphores(&signal_semaphores)
+                        .wait_semaphores(&wait_semaphors)
                         .swapchains(&swapchains)
                         .image_indices(&image_indices);
 
@@ -521,8 +525,6 @@ fn main() -> anyhow::Result<()> {
                     } {
                         println!("Error while presenting: {:?}", err);
                     }
-
-                    frame = (frame + 1) % FRAMES_IN_FLIGHT;
                 }
                 Err(error) => println!("Next frame error: {:?}", error),
             }
@@ -747,51 +749,29 @@ impl Swapchain {
 }
 
 struct Syncronisation {
-    image_available_semaphores: Vec<vk::Semaphore>,
-    render_finished_semaphores: Vec<vk::Semaphore>,
-    in_flight_fences: Vec<vk::Fence>,
-    images_in_flight: Vec<vk::Fence>,
+    present_complete_semaphore: vk::Semaphore,
+    rendering_complete_semaphore: vk::Semaphore,
+    draw_commands_fence: vk::Fence,
 }
 
 impl Syncronisation {
-    fn new(device: &Device, num_images: usize) -> Self {
+    fn new(device: &Device) -> Self {
         let semaphore_info = vk::SemaphoreCreateInfo::builder();
         let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
 
         Self {
-            image_available_semaphores: (0..FRAMES_IN_FLIGHT)
-                .map(|_| unsafe { device.create_semaphore(&semaphore_info, None) }.unwrap())
-                .collect(),
-            render_finished_semaphores: (0..FRAMES_IN_FLIGHT)
-                .map(|_| unsafe { device.create_semaphore(&semaphore_info, None) }.unwrap())
-                .collect(),
-            in_flight_fences: (0..FRAMES_IN_FLIGHT)
-                .map(|_| unsafe { device.create_fence(&fence_info, None) }.unwrap())
-                .collect(),
-            images_in_flight: (0..num_images).map(|_| vk::Fence::null()).collect(),
+            present_complete_semaphore: unsafe { device.create_semaphore(&semaphore_info, None) }
+                .unwrap(),
+            rendering_complete_semaphore: unsafe { device.create_semaphore(&semaphore_info, None) }
+                .unwrap(),
+            draw_commands_fence: unsafe { device.create_fence(&fence_info, None) }.unwrap(),
         }
-    }
-
-    fn wait_fences(&mut self, device: &Device, image_index: usize, frame: usize) {
-        let image_in_flight = self.images_in_flight[image_index];
-        if image_in_flight != vk::Fence::null() {
-            unsafe { device.wait_for_fences(&[image_in_flight], true, u64::MAX) }.unwrap();
-        }
-        self.images_in_flight[image_index] = self.in_flight_fences[frame];
     }
 
     unsafe fn cleanup(&self, device: &Device) {
-        for &semaphore in self
-            .image_available_semaphores
-            .iter()
-            .chain(self.render_finished_semaphores.iter())
-        {
-            device.destroy_semaphore(semaphore, None);
-        }
-
-        for &fence in &self.in_flight_fences {
-            device.destroy_fence(fence, None);
-        }
+        device.destroy_semaphore(self.present_complete_semaphore, None);
+        device.destroy_semaphore(self.rendering_complete_semaphore, None);
+        device.destroy_fence(self.draw_commands_fence, None)
     }
 }
 
