@@ -133,18 +133,21 @@ fn main() -> anyhow::Result<()> {
                     })
                     .or_else(|| formats.get(0))
                 {
-                    Some(surface_format) => surface_format.clone(),
+                    Some(surface_format) => *surface_format,
                     None => return None,
                 };
 
                 let supported_device_extensions = instance
                     .enumerate_device_extension_properties(physical_device)
                     .unwrap();
-                if !device_extensions.iter().all(|device_extension| {
+
+                let has_needed_extensions = device_extensions.iter().all(|device_extension| {
                     supported_device_extensions.iter().any(|properties| {
                         &CStr::from_ptr(properties.extension_name.as_ptr()) == device_extension
                     })
-                }) {
+                });
+
+                if !has_needed_extensions {
                     return None;
                 }
 
@@ -516,12 +519,12 @@ fn main() -> anyhow::Result<()> {
                             .swapchain_loader
                             .queue_present(queue, &present_info)
                     } {
-                        println!("Error while presenting: {}", err);
+                        println!("Error while presenting: {:?}", err);
                     }
 
                     frame = (frame + 1) % FRAMES_IN_FLIGHT;
                 }
-                Err(error) => println!("Next frame error: {}", error),
+                Err(error) => println!("Next frame error: {:?}", error),
             }
         }
         Event::LoopDestroyed => unsafe {
@@ -671,7 +674,7 @@ struct Swapchain {
     swapchain: vk::SwapchainKHR,
     framebuffers: Vec<vk::Framebuffer>,
     image_views: Vec<vk::ImageView>,
-    images: Vec<vk::Image>,
+    _images: Vec<vk::Image>,
 }
 
 impl Swapchain {
@@ -721,12 +724,14 @@ impl Swapchain {
         Ok(Self {
             framebuffers,
             image_views,
-            images,
+            _images: images,
             swapchain,
             swapchain_loader,
         })
     }
 
+    // note: we don't destroy the images here because they're still being used
+    // when we resize
     unsafe fn cleanup(&self, device: &Device) {
         for &framebuffer in &self.framebuffers {
             device.destroy_framebuffer(framebuffer, None);
