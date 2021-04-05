@@ -1,12 +1,10 @@
-// This code roughly follows https://vulkan-tutorial.com/ - Drawing a triangle
-
 use ash::extensions::ext::DebugUtils as DebugUtilsLoader;
 use ash::extensions::khr::{Surface as SurfaceLoader, Swapchain as SwapchainLoader};
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::{util, vk, Device};
 use byte_strings::c_str;
 use std::ffi::CStr;
-use ultraviolet::{Mat4, Vec3};
+use ultraviolet::{Mat4, Vec2, Vec3};
 use winit::{
     event::{
         DeviceEvent, ElementState, Event, KeyboardInput, StartCause, VirtualKeyCode, WindowEvent,
@@ -191,21 +189,39 @@ fn main() -> anyhow::Result<()> {
 
     let (verts, indices) = cube_verts();
 
-    let vertex_buffer = Buffer::new(
-        bytemuck::cast_slice(&verts),
-        vk::BufferUsageFlags::VERTEX_BUFFER,
-        &allocator,
-        queue_family,
-    )?;
+    let cube = Model {
+        vertices: Buffer::new(
+            bytemuck::cast_slice(&verts),
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            &allocator,
+            queue_family,
+        )?,
+        indices: Buffer::new(
+            bytemuck::cast_slice(&indices),
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            &allocator,
+            queue_family,
+        )?,
+        num_indices: indices.len() as u32,
+    };
 
-    let index_buffer = Buffer::new(
-        bytemuck::cast_slice(&indices),
-        vk::BufferUsageFlags::INDEX_BUFFER,
-        &allocator,
-        queue_family,
-    )?;
+    let (verts, indices) = plane_verts();
 
-    let num_indices = indices.len() as u32;
+    let plane = Model {
+        vertices: Buffer::new(
+            bytemuck::cast_slice(&verts),
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            &allocator,
+            queue_family,
+        )?,
+        indices: Buffer::new(
+            bytemuck::cast_slice(&indices),
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            &allocator,
+            queue_family,
+        )?,
+        num_indices: indices.len() as u32,
+    };
 
     // https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Render_passes
     let attachments = [
@@ -250,7 +266,8 @@ fn main() -> anyhow::Result<()> {
 
     let render_pass = unsafe { device.create_render_pass(&render_pass_info, None) }?;
 
-    let pipelines = Pipelines::new(&device, render_pass)?;
+    let resources = Resources::new(&device)?;
+    let pipelines = Pipelines::new(&device, render_pass, &resources)?;
 
     let surface_caps = unsafe {
         surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
@@ -267,7 +284,8 @@ fn main() -> anyhow::Result<()> {
         height: window_size.height,
     };
 
-    let mut depth_buffer = DepthBuffer::new(extent.width, extent.height, &device, &allocator)?;
+    let mut depth_buffer =
+        Image::new_depth_buffer(extent.width, extent.height, &device, &allocator)?;
 
     let mut swapchain_info = *vk::SwapchainCreateInfoKHR::builder()
         .surface(surface)
@@ -294,10 +312,12 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     // https://vulkan-tutorial.com/Drawing_a_triangle/Drawing/Command_buffers
-    let command_pool_info = vk::CommandPoolCreateInfo::builder()
-        .queue_family_index(queue_family)
-        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-    let command_pool = unsafe { device.create_command_pool(&command_pool_info, None) }?;
+    let command_pool = unsafe {
+        device.create_command_pool(
+            &vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family),
+            None,
+        )
+    }?;
 
     let cmd_buf_allocate_info = vk::CommandBufferAllocateInfo::builder()
         .command_pool(command_pool)
@@ -305,9 +325,83 @@ fn main() -> anyhow::Result<()> {
         .command_buffer_count(1);
     let command_buffer = unsafe { device.allocate_command_buffers(&cmd_buf_allocate_info) }?[0];
 
-    let syncronisation = Syncronisation::new(&device);
+    let descriptor_pool = unsafe {
+        device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::builder()
+                .pool_sizes(&[*vk::DescriptorPoolSize::builder()
+                    .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)])
+                .max_sets(1),
+            None,
+        )
+    }?;
 
-    let view_matrix = Mat4::look_at(Vec3::new(-1.0, 0.0, 0.0), Vec3::zero(), Vec3::unit_y());
+    let image = unsafe {
+        device.begin_command_buffer(
+            command_buffer,
+            &vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )?;
+
+        let (image, staging_buffer) = load_png_image_from_bytes(
+            include_bytes!("../explosion.png"),
+            command_buffer,
+            &device,
+            &allocator,
+            queue_family,
+        )?;
+
+        device.end_command_buffer(command_buffer)?;
+
+        let image_written_fence = device.create_fence(&vk::FenceCreateInfo::builder(), None)?;
+
+        device.queue_submit(
+            queue,
+            &[*vk::SubmitInfo::builder().command_buffers(&[command_buffer])],
+            image_written_fence,
+        )?;
+
+        device.wait_for_fences(&[image_written_fence], true, u64::MAX)?;
+
+        device.destroy_fence(image_written_fence, None);
+
+        staging_buffer.cleanup(&allocator)?;
+
+        image
+    };
+
+    let sampler = unsafe {
+        device.create_sampler(
+            &*vk::SamplerCreateInfo::builder().mag_filter(vk::Filter::LINEAR),
+            None,
+        )
+    }?;
+
+    let descriptor_sets = unsafe {
+        device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::builder()
+                .set_layouts(&[resources.single_texture_dsl])
+                .descriptor_pool(descriptor_pool),
+        )
+    }?;
+
+    let single_texture_set = descriptor_sets[0];
+
+    unsafe {
+        device.update_descriptor_sets(
+            &[*vk::WriteDescriptorSet::builder()
+                .dst_set(single_texture_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&[*vk::DescriptorImageInfo::builder()
+                    .sampler(sampler)
+                    .image_view(image.view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)])],
+            &[],
+        );
+    }
+
+    let view_matrix = Mat4::look_at(Vec3::new(-2.0, 1.0, 0.0), Vec3::zero(), Vec3::unit_y());
 
     let perspective_matrix = ultraviolet::projection::perspective_infinite_z_vk(
         59.0_f32.to_radians(),
@@ -317,6 +411,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut perspective_view_matrix = perspective_matrix * view_matrix;
     let mut cube_rotation = 0.0;
+
+    let syncronisation = Syncronisation::new(&device);
 
     event_loop.run(move |event, _, control_flow| match event {
         Event::NewEvents(StartCause::Init) => {
@@ -344,7 +440,8 @@ fn main() -> anyhow::Result<()> {
                 depth_buffer.cleanup(&device, &allocator).unwrap();
 
                 depth_buffer =
-                    DepthBuffer::new(extent.width, extent.height, &device, &allocator).unwrap();
+                    Image::new_depth_buffer(extent.width, extent.height, &device, &allocator)
+                        .unwrap();
 
                 unsafe {
                     swapchain.cleanup(&device);
@@ -387,6 +484,16 @@ fn main() -> anyhow::Result<()> {
                 Ok((image_index, _suboptimal)) => {
                     let framebuffer = swapchain.framebuffers[image_index as usize];
 
+                    let window_area = vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent,
+                    };
+
+                    let viewport = *vk::Viewport::builder()
+                        .width(extent.width as f32)
+                        .height(extent.height as f32)
+                        .max_depth(1.0);
+
                     unsafe {
                         device
                             .wait_for_fences(&[syncronisation.draw_commands_fence], true, u64::MAX)
@@ -395,62 +502,43 @@ fn main() -> anyhow::Result<()> {
                         device
                             .reset_fences(&[syncronisation.draw_commands_fence])
                             .unwrap();
-                    }
 
-                    let cmd_buf_begin_info = vk::CommandBufferBeginInfo::builder()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-                    let clear_values = [
-                        vk::ClearValue {
-                            color: vk::ClearColorValue {
-                                float32: [0.0, 0.0, 0.0, 1.0],
-                            },
-                        },
-                        vk::ClearValue {
-                            depth_stencil: vk::ClearDepthStencilValue {
-                                depth: 1.0,
-                                stencil: 0,
-                            },
-                        },
-                    ];
-                    let area = vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent,
-                    };
-                    let render_pass_begin_info = vk::RenderPassBeginInfo::builder()
-                        .render_pass(render_pass)
-                        .framebuffer(framebuffer)
-                        .render_area(area)
-                        .clear_values(&clear_values);
-
-                    let viewport = *vk::Viewport::builder()
-                        .x(0.0)
-                        .y(0.0)
-                        .width(extent.width as f32)
-                        .height(extent.height as f32)
-                        .min_depth(0.0)
-                        .max_depth(1.0);
-
-                    unsafe {
                         device
-                            .begin_command_buffer(command_buffer, &cmd_buf_begin_info)
+                            .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
+                            .unwrap();
+
+                        device
+                            .begin_command_buffer(
+                                command_buffer,
+                                &vk::CommandBufferBeginInfo::builder()
+                                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                            )
                             .unwrap();
 
                         device.cmd_set_viewport(command_buffer, 0, &[viewport]);
-                        device.cmd_set_scissor(command_buffer, 0, &[area]);
+                        device.cmd_set_scissor(command_buffer, 0, &[window_area]);
 
                         device.cmd_begin_render_pass(
                             command_buffer,
-                            &render_pass_begin_info,
+                            &vk::RenderPassBeginInfo::builder()
+                                .render_pass(render_pass)
+                                .framebuffer(framebuffer)
+                                .render_area(window_area)
+                                .clear_values(&[
+                                    vk::ClearValue {
+                                        color: vk::ClearColorValue {
+                                            float32: [0.0, 0.25, 0.5, 1.0],
+                                        },
+                                    },
+                                    vk::ClearValue {
+                                        depth_stencil: vk::ClearDepthStencilValue {
+                                            depth: 1.0,
+                                            stencil: 0,
+                                        },
+                                    },
+                                ]),
                             vk::SubpassContents::INLINE,
                         );
-
-                        device.cmd_bind_pipeline(
-                            command_buffer,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            pipelines.triangle_pipeline,
-                        );
-                        device.cmd_draw(command_buffer, 3, 1, 0, 0);
 
                         device.cmd_bind_pipeline(
                             command_buffer,
@@ -460,12 +548,12 @@ fn main() -> anyhow::Result<()> {
                         device.cmd_bind_vertex_buffers(
                             command_buffer,
                             0,
-                            &[vertex_buffer.buffer],
+                            &[cube.vertices.buffer],
                             &[0],
                         );
                         device.cmd_bind_index_buffer(
                             command_buffer,
-                            index_buffer.buffer,
+                            cube.indices.buffer,
                             0,
                             vk::IndexType::UINT16,
                         );
@@ -474,56 +562,83 @@ fn main() -> anyhow::Result<()> {
                             pipelines.push_constants_pipeline_layout,
                             vk::ShaderStageFlags::VERTEX,
                             0,
-                            bytemuck::bytes_of(&CubePushConstants {
+                            bytemuck::bytes_of(&PushConstants {
                                 perspective_view_matrix,
-                                cube_transform: Mat4::from_translation(Vec3::new(0.0, 0.0, 0.25))
+                                cube_transform: Mat4::from_translation(Vec3::new(0.0, 0.5, 0.0))
                                     * Mat4::from_rotation_y(cube_rotation)
                                     * Mat4::from_rotation_z(cube_rotation * 0.5)
                                     * Mat4::from_scale(0.2),
                             }),
                         );
-                        device.cmd_draw_indexed(command_buffer, num_indices, 1, 0, 0, 0);
+                        device.cmd_draw_indexed(command_buffer, cube.num_indices, 1, 0, 0, 0);
+
+                        device.cmd_bind_pipeline(
+                            command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            pipelines.plane_pipeline,
+                        );
+                        device.cmd_bind_descriptor_sets(
+                            command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            pipelines.textured_pipeline_layout,
+                            0,
+                            &[single_texture_set],
+                            &[],
+                        );
+                        device.cmd_bind_vertex_buffers(
+                            command_buffer,
+                            0,
+                            &[plane.vertices.buffer],
+                            &[0],
+                        );
+                        device.cmd_bind_index_buffer(
+                            command_buffer,
+                            plane.indices.buffer,
+                            0,
+                            vk::IndexType::UINT16,
+                        );
+                        device.cmd_push_constants(
+                            command_buffer,
+                            pipelines.push_constants_pipeline_layout,
+                            vk::ShaderStageFlags::VERTEX,
+                            0,
+                            bytemuck::bytes_of(&PushConstants {
+                                perspective_view_matrix,
+                                cube_transform: Mat4::from_scale(5.0),
+                            }),
+                        );
+                        device.cmd_draw_indexed(command_buffer, plane.num_indices, 1, 0, 0, 0);
 
                         device.cmd_end_render_pass(command_buffer);
 
                         device.end_command_buffer(command_buffer).unwrap();
-                    }
 
-                    let wait_semaphores = [syncronisation.present_complete_semaphore];
-                    let command_buffers = [command_buffer];
-                    let signal_semaphores = [syncronisation.rendering_complete_semaphore];
-                    let submit_info = vk::SubmitInfo::builder()
-                        .wait_semaphores(&wait_semaphores)
-                        .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
-                        .command_buffers(&command_buffers)
-                        .signal_semaphores(&signal_semaphores);
-
-                    unsafe {
                         device
                             .queue_submit(
                                 queue,
-                                &[*submit_info],
+                                &[*vk::SubmitInfo::builder()
+                                    .wait_semaphores(&[syncronisation.present_complete_semaphore])
+                                    .wait_dst_stage_mask(&[
+                                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                                    ])
+                                    .command_buffers(&[command_buffer])
+                                    .signal_semaphores(&[
+                                        syncronisation.rendering_complete_semaphore
+                                    ])],
                                 syncronisation.draw_commands_fence,
                             )
                             .unwrap();
-                    }
 
-                    let wait_semaphors = [syncronisation.rendering_complete_semaphore];
-                    let image_indices = [image_index];
-                    let swapchains = [swapchain.swapchain];
-                    let present_info = vk::PresentInfoKHR::builder()
-                        .wait_semaphores(&wait_semaphors)
-                        .swapchains(&swapchains)
-                        .image_indices(&image_indices);
-
-                    // Sometimes, resizes can happen between acquiring a frame and presenting.
-                    // In this case, there isn't anything we can really do so we just print an error.
-                    if let Err(err) = unsafe {
                         swapchain
                             .swapchain_loader
-                            .queue_present(queue, &present_info)
-                    } {
-                        println!("Error while presenting: {:?}", err);
+                            .queue_present(
+                                queue,
+                                &vk::PresentInfoKHR::builder()
+                                    .wait_semaphores(&[syncronisation.rendering_complete_semaphore])
+                                    .swapchains(&[swapchain.swapchain])
+                                    .image_indices(&[image_index]),
+                            )
+                            .expect("Presenting failed. This is very unlikely to happen.");
                     }
                 }
                 Err(error) => println!("Next frame error: {:?}", error),
@@ -532,15 +647,15 @@ fn main() -> anyhow::Result<()> {
         Event::LoopDestroyed => unsafe {
             device.device_wait_idle().unwrap();
 
+            resources.cleanup(&device);
+            device.destroy_sampler(sampler, None);
+            device.destroy_descriptor_pool(descriptor_pool, None);
+
             syncronisation.cleanup(&device);
-            depth_buffer.cleanup(&device, &allocator).unwrap();
-            vertex_buffer.cleanup(&allocator).unwrap();
-            index_buffer.cleanup(&allocator).unwrap();
 
             device.destroy_command_pool(command_pool, None);
 
             swapchain.cleanup(&device);
-
             pipelines.cleanup(&device);
 
             device.destroy_render_pass(render_pass, None);
@@ -548,6 +663,12 @@ fn main() -> anyhow::Result<()> {
             surface_loader.destroy_surface(surface, None);
 
             debug_utils_loader.destroy_debug_utils_messenger(debug_messenger, None);
+
+            cube.cleanup(&allocator).unwrap();
+            plane.cleanup(&allocator).unwrap();
+
+            depth_buffer.cleanup(&device, &allocator).unwrap();
+            image.cleanup(&device, &allocator).unwrap();
 
             allocator.destroy();
 
@@ -560,14 +681,27 @@ fn main() -> anyhow::Result<()> {
     })
 }
 
-struct DepthBuffer {
+struct Model {
+    vertices: Buffer,
+    indices: Buffer,
+    num_indices: u32,
+}
+
+impl Model {
+    unsafe fn cleanup(&self, allocator: &vk_mem::Allocator) -> anyhow::Result<()> {
+        self.vertices.cleanup(allocator)?;
+        self.indices.cleanup(allocator)
+    }
+}
+
+struct Image {
     image: vk::Image,
     allocation: vk_mem::Allocation,
     view: vk::ImageView,
 }
 
-impl DepthBuffer {
-    fn new(
+impl Image {
+    fn new_depth_buffer(
         width: u32,
         height: u32,
         device: &Device,
@@ -777,7 +911,7 @@ impl Syncronisation {
 
 #[derive(Copy, Clone, bytemuck::Zeroable, bytemuck::Pod, Debug)]
 #[repr(C)]
-struct CubePushConstants {
+struct PushConstants {
     perspective_view_matrix: Mat4,
     cube_transform: Mat4,
 }
@@ -787,6 +921,23 @@ struct CubePushConstants {
 struct Vertex {
     position: Vec3,
     colour: Vec3,
+}
+
+impl Vertex {
+    fn attribute_desc() -> [vk::VertexInputAttributeDescription; 2] {
+        [
+            *vk::VertexInputAttributeDescription::builder()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0),
+            *vk::VertexInputAttributeDescription::builder()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(std::mem::size_of::<Vec3>() as u32),
+        ]
+    }
 }
 
 fn vertex(x: f32, z: f32, y: f32) -> Vertex {
@@ -821,14 +972,67 @@ fn cube_verts() -> ([Vertex; 8], [u16; 36]) {
     )
 }
 
+fn plane_verts() -> ([TexturedVertex; 4], [u16; 6]) {
+    (
+        [
+            TexturedVertex {
+                position: Vec3::new(-1.0, 0.0, -1.0),
+                uv: Vec2::new(0.0, 0.0),
+            },
+            TexturedVertex {
+                position: Vec3::new(1.0, 0.0, -1.0),
+                uv: Vec2::new(1.0, 0.0),
+            },
+            TexturedVertex {
+                position: Vec3::new(-1.0, 0.0, 1.0),
+                uv: Vec2::new(0.0, 1.0),
+            },
+            TexturedVertex {
+                position: Vec3::new(1.0, 0.0, 1.0),
+                uv: Vec2::new(1.0, 1.0),
+            },
+        ],
+        [1, 0, 2, 1, 2, 3],
+    )
+}
+
+#[derive(Copy, Clone, bytemuck::Zeroable, bytemuck::Pod, Debug)]
+#[repr(C)]
+struct TexturedVertex {
+    position: Vec3,
+    uv: Vec2,
+}
+
+impl TexturedVertex {
+    fn attribute_desc() -> [vk::VertexInputAttributeDescription; 2] {
+        [
+            *vk::VertexInputAttributeDescription::builder()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0),
+            *vk::VertexInputAttributeDescription::builder()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(std::mem::size_of::<Vec3>() as u32),
+        ]
+    }
+}
+
 struct Pipelines {
-    triangle_pipeline: vk::Pipeline,
     cube_pipeline: vk::Pipeline,
+    plane_pipeline: vk::Pipeline,
     push_constants_pipeline_layout: vk::PipelineLayout,
+    textured_pipeline_layout: vk::PipelineLayout,
 }
 
 impl Pipelines {
-    fn new(device: &Device, render_pass: vk::RenderPass) -> anyhow::Result<Self> {
+    fn new(
+        device: &Device,
+        render_pass: vk::RenderPass,
+        resources: &Resources,
+    ) -> anyhow::Result<Self> {
         let pipeline_cache = unsafe {
             device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::builder().build(), None)?
         };
@@ -838,12 +1042,22 @@ impl Pipelines {
                 &vk::PipelineLayoutCreateInfo::builder().push_constant_ranges(&[
                     *vk::PushConstantRange::builder()
                         .stage_flags(vk::ShaderStageFlags::VERTEX)
-                        .size(std::mem::size_of::<CubePushConstants>() as u32),
+                        .size(std::mem::size_of::<PushConstants>() as u32),
                 ]),
                 None,
             )
-        }
-        .unwrap();
+        }?;
+
+        let textured_pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::builder()
+                    .set_layouts(&[resources.single_texture_dsl])
+                    .push_constant_ranges(&[*vk::PushConstantRange::builder()
+                        .stage_flags(vk::ShaderStageFlags::VERTEX)
+                        .size(std::mem::size_of::<PushConstants>() as u32)]),
+                None,
+            )
+        }?;
 
         let viewport_state = vk::PipelineViewportStateCreateInfo::builder()
             .viewport_count(1)
@@ -864,10 +1078,6 @@ impl Pipelines {
             .sample_shading_enable(false)
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-        let rasterizer = vk::PipelineRasterizationStateCreateInfo::builder()
-            .polygon_mode(vk::PolygonMode::FILL)
-            .line_width(1.0);
-
         let cull_rasterizer = vk::PipelineRasterizationStateCreateInfo::builder()
             .polygon_mode(vk::PolygonMode::FILL)
             .cull_mode(vk::CullModeFlags::BACK)
@@ -881,74 +1091,33 @@ impl Pipelines {
             .depth_write_enable(true)
             .depth_compare_op(vk::CompareOp::LESS);
 
-        let empty_vertex_input = vk::PipelineVertexInputStateCreateInfo::builder();
-
         let vertex_binding_desc = &[*vk::VertexInputBindingDescription::builder()
             .binding(0)
             .stride(std::mem::size_of::<Vertex>() as u32)];
 
-        let vertex_attr_desc = &[
-            *vk::VertexInputAttributeDescription::builder()
-                .binding(0)
-                .location(0)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(0),
-            *vk::VertexInputAttributeDescription::builder()
-                .binding(0)
-                .location(1)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(std::mem::size_of::<Vec3>() as u32),
-        ];
+        let vertex_attr_desc = &Vertex::attribute_desc();
 
         let cube_vertex_input = vk::PipelineVertexInputStateCreateInfo::builder()
             .vertex_binding_descriptions(vertex_binding_desc)
             .vertex_attribute_descriptions(vertex_attr_desc);
 
-        let vs_triangle = util::read_spv(&mut std::io::Cursor::new(include_bytes!(
-            "../shaders/compiled/triangle.vert.spv"
-        )))
-        .unwrap();
-        let vs_triangle = vk::ShaderModuleCreateInfo::builder().code(&vs_triangle);
-        let vs_triangle = unsafe { device.create_shader_module(&vs_triangle, None) }.unwrap();
+        let textured_vertex_binding_desc = &[*vk::VertexInputBindingDescription::builder()
+            .binding(0)
+            .stride(std::mem::size_of::<TexturedVertex>() as u32)];
 
-        let vs_cube = util::read_spv(&mut std::io::Cursor::new(include_bytes!(
-            "../shaders/compiled/cube.vert.spv"
-        )))
-        .unwrap();
-        let vs_cube = vk::ShaderModuleCreateInfo::builder().code(&vs_cube);
-        let vs_cube = unsafe { device.create_shader_module(&vs_cube, None) }.unwrap();
+        let textured_vertex_attr_desc = &TexturedVertex::attribute_desc();
 
-        let fs_colour = util::read_spv(&mut std::io::Cursor::new(include_bytes!(
-            "../shaders/compiled/colour.frag.spv"
-        )))
-        .unwrap();
-        let fs_colour = vk::ShaderModuleCreateInfo::builder().code(&fs_colour);
-        let fs_colour = unsafe { device.create_shader_module(&fs_colour, None) }.unwrap();
+        let textured_vertex_input = vk::PipelineVertexInputStateCreateInfo::builder()
+            .vertex_binding_descriptions(textured_vertex_binding_desc)
+            .vertex_attribute_descriptions(textured_vertex_attr_desc);
 
-        let triangle_pipeline_stages = [
-            *vk::PipelineShaderStageCreateInfo::builder()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(vs_triangle)
-                .name(&c_str!("main")),
-            *vk::PipelineShaderStageCreateInfo::builder()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(fs_colour)
-                .name(&c_str!("main")),
-        ];
+        let vs_cube =
+            load_shader_module(include_bytes!("../shaders/compiled/cube.vert.spv"), &device)?;
 
-        let triangle_pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
-            .stages(&triangle_pipeline_stages)
-            .vertex_input_state(&empty_vertex_input)
-            .input_assembly_state(&triangle_assembly)
-            .viewport_state(&viewport_state)
-            .rasterization_state(&rasterizer)
-            .multisample_state(&multisampling)
-            .color_blend_state(&color_blending)
-            .dynamic_state(&dynamic_state)
-            .depth_stencil_state(&depth_stencil)
-            .layout(push_constants_pipeline_layout)
-            .render_pass(render_pass)
-            .subpass(0);
+        let fs_colour = load_shader_module(
+            include_bytes!("../shaders/compiled/colour.frag.spv"),
+            &device,
+        )?;
 
         let cube_pipeline_stages = [
             *vk::PipelineShaderStageCreateInfo::builder()
@@ -975,34 +1144,227 @@ impl Pipelines {
             .render_pass(render_pass)
             .subpass(0);
 
+        let vs_plane = load_shader_module(
+            include_bytes!("../shaders/compiled/plane.vert.spv"),
+            &device,
+        )?;
+
+        let fs_textured = load_shader_module(
+            include_bytes!("../shaders/compiled/textured.frag.spv"),
+            &device,
+        )?;
+
+        let plane_pipeline_stages = [
+            *vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vs_plane)
+                .name(&c_str!("main")),
+            *vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fs_textured)
+                .name(&c_str!("main")),
+        ];
+
+        let plane_pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&plane_pipeline_stages)
+            .vertex_input_state(&textured_vertex_input)
+            .input_assembly_state(&triangle_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&cull_rasterizer)
+            .multisample_state(&multisampling)
+            .color_blend_state(&color_blending)
+            .dynamic_state(&dynamic_state)
+            .depth_stencil_state(&depth_stencil)
+            .layout(textured_pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0);
+
         let pipelines = unsafe {
             device.create_graphics_pipelines(
                 pipeline_cache,
-                &[*triangle_pipeline_info, *cube_pipeline_info],
+                &[*cube_pipeline_info, *plane_pipeline_info],
                 None,
             )
         }
         .unwrap();
 
         let pipelines = Self {
-            triangle_pipeline: pipelines[0],
-            cube_pipeline: pipelines[1],
+            cube_pipeline: pipelines[0],
+            plane_pipeline: pipelines[1],
             push_constants_pipeline_layout,
+            textured_pipeline_layout,
         };
 
         unsafe {
             device.destroy_pipeline_cache(pipeline_cache, None);
-            device.destroy_shader_module(vs_triangle, None);
             device.destroy_shader_module(vs_cube, None);
             device.destroy_shader_module(fs_colour, None);
+            device.destroy_shader_module(vs_plane, None);
+            device.destroy_shader_module(fs_textured, None);
         }
 
         Ok(pipelines)
     }
 
     unsafe fn cleanup(&self, device: &Device) {
+        device.destroy_pipeline_layout(self.textured_pipeline_layout, None);
         device.destroy_pipeline_layout(self.push_constants_pipeline_layout, None);
-        device.destroy_pipeline(self.triangle_pipeline, None);
         device.destroy_pipeline(self.cube_pipeline, None);
+        device.destroy_pipeline(self.plane_pipeline, None);
     }
+}
+
+fn load_shader_module(bytes: &[u8], device: &Device) -> anyhow::Result<vk::ShaderModule> {
+    let spv = util::read_spv(&mut std::io::Cursor::new(bytes))?;
+    unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(&spv), None) }
+        .map_err(|err| err.into())
+}
+
+struct Resources {
+    single_texture_dsl: vk::DescriptorSetLayout,
+}
+
+impl Resources {
+    fn new(device: &Device) -> anyhow::Result<Self> {
+        Ok(Self {
+            single_texture_dsl: unsafe {
+                device.create_descriptor_set_layout(
+                    &*vk::DescriptorSetLayoutCreateInfo::builder().bindings(&[
+                        *vk::DescriptorSetLayoutBinding::builder()
+                            .binding(0)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    ]),
+                    None,
+                )
+            }?,
+        })
+    }
+
+    unsafe fn cleanup(&self, device: &Device) {
+        device.destroy_descriptor_set_layout(self.single_texture_dsl, None);
+    }
+}
+
+fn load_png_image_from_bytes(
+    bytes: &[u8],
+    command_buffer: vk::CommandBuffer,
+    device: &Device,
+    allocator: &vk_mem::Allocator,
+    queue_family: u32,
+) -> anyhow::Result<(Image, Buffer)> {
+    let decompressed = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)?;
+
+    let decompressed = match decompressed {
+        image::DynamicImage::ImageRgba8(image) => image,
+        _ => panic!(),
+    };
+
+    let staging_buffer = Buffer::new(
+        &*decompressed,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        &allocator,
+        queue_family,
+    )?;
+
+    let extent = vk::Extent3D {
+        width: decompressed.width(),
+        height: decompressed.height(),
+        depth: 1,
+    };
+
+    let (image, allocation, _allocation_info) = allocator.create_image(
+        &vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_SRGB)
+            .extent(extent)
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST),
+        &vk_mem::AllocationCreateInfo {
+            usage: vk_mem::MemoryUsage::GpuOnly,
+            ..Default::default()
+        },
+    )?;
+
+    let subresource_range = vk::ImageSubresourceRange::builder()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1);
+
+    let view = unsafe {
+        device.create_image_view(
+            &vk::ImageViewCreateInfo::builder()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::R8G8B8A8_SRGB)
+                .subresource_range(*subresource_range),
+            None,
+        )
+    }?;
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            // See
+            // https://www.khronos.org/registry/vulkan/specs/1.0/html/vkspec.html#synchronization-access-types-supported
+            // https://vulkan-tutorial.com/Texture_mapping/Images
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[*vk::ImageMemoryBarrier::builder()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .image(image)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .subresource_range(*subresource_range)],
+        );
+
+        device.cmd_copy_buffer_to_image(
+            command_buffer,
+            staging_buffer.buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[*vk::BufferImageCopy::builder()
+                .buffer_row_length(decompressed.width())
+                .buffer_image_height(decompressed.height())
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(extent)],
+        );
+
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[*vk::ImageMemoryBarrier::builder()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(image)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .subresource_range(*subresource_range)],
+        );
+    }
+
+    Ok((
+        Image {
+            image,
+            view,
+            allocation,
+        },
+        staging_buffer,
+    ))
 }
