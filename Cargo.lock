@@ -33,17 +33,26 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.39"
+version = "1.0.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81cddc5f91628367664cc7c69714ff08deee8a3efc54623011c772544d7b2767"
+checksum = "28b2cd92db5cbd74e8e5028f7e27dd7aa3090e89e4f2a197cc7c8dfb69c7063b"
 
 [[package]]
 name = "ash"
-version = "0.32.0"
+version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ea56be8250318e64923c7e65b82a35b5c29dfb6dc1c7d1c0b288c4b1bbb084"
+checksum = "06063a002a77d2734631db74e8f4ce7148b77fe522e6bca46f2ae7774fd48112"
 dependencies = [
  "libloading 0.7.0",
+]
+
+[[package]]
+name = "ash-helpers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "vk-mem",
 ]
 
 [[package]]
@@ -1234,6 +1243,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ash",
+ "ash-helpers",
  "ash-window",
  "byte-strings",
  "bytemuck",
