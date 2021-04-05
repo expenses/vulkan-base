@@ -4,6 +4,7 @@ use ash::extensions::ext::DebugUtils as DebugUtilsLoader;
 use ash::extensions::khr::{Surface as SurfaceLoader, Swapchain as SwapchainLoader};
 use ash::version::{DeviceV1_0, EntryV1_0, InstanceV1_0};
 use ash::{util, vk, Device};
+use ash_helpers::{Buffer, Image};
 use byte_strings::c_str;
 use std::ffi::CStr;
 use ultraviolet::{Mat4, Vec3};
@@ -267,7 +268,8 @@ fn main() -> anyhow::Result<()> {
         height: window_size.height,
     };
 
-    let mut depth_buffer = DepthBuffer::new(extent.width, extent.height, &device, &allocator)?;
+    let mut depth_buffer =
+        Image::new_depth_buffer(extent.width, extent.height, &device, &allocator)?;
 
     let mut swapchain_info = *vk::SwapchainCreateInfoKHR::builder()
         .surface(surface)
@@ -344,7 +346,8 @@ fn main() -> anyhow::Result<()> {
                 depth_buffer.cleanup(&device, &allocator).unwrap();
 
                 depth_buffer =
-                    DepthBuffer::new(extent.width, extent.height, &device, &allocator).unwrap();
+                    Image::new_depth_buffer(extent.width, extent.height, &device, &allocator)
+                        .unwrap();
 
                 unsafe {
                     swapchain.cleanup(&device);
@@ -558,117 +561,6 @@ fn main() -> anyhow::Result<()> {
         },
         _ => (),
     })
-}
-
-struct DepthBuffer {
-    image: vk::Image,
-    allocation: vk_mem::Allocation,
-    view: vk::ImageView,
-}
-
-impl DepthBuffer {
-    fn new(
-        width: u32,
-        height: u32,
-        device: &Device,
-        allocator: &vk_mem::Allocator,
-    ) -> anyhow::Result<Self> {
-        let (image, allocation, _allocation_info) = allocator
-            .create_image(
-                &vk::ImageCreateInfo::builder()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk::Format::D32_SFLOAT)
-                    .extent(vk::Extent3D {
-                        width,
-                        height,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
-                &vk_mem::AllocationCreateInfo {
-                    usage: vk_mem::MemoryUsage::GpuOnly,
-                    flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
-                    ..Default::default()
-                },
-            )
-            .map_err(|err| anyhow::anyhow!("{:?}", err))?;
-
-        let view = unsafe {
-            device.create_image_view(
-                &vk::ImageViewCreateInfo::builder()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::D32_SFLOAT)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::builder()
-                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                            .level_count(1)
-                            .layer_count(1)
-                            .build(),
-                    ),
-                None,
-            )
-        }?;
-
-        Ok(Self {
-            image,
-            allocation,
-            view,
-        })
-    }
-
-    fn cleanup(&self, device: &Device, allocator: &vk_mem::Allocator) -> anyhow::Result<()> {
-        unsafe {
-            device.destroy_image_view(self.view, None);
-        }
-
-        allocator
-            .destroy_image(self.image, &self.allocation)
-            .map_err(|err| err.into())
-    }
-}
-
-struct Buffer {
-    buffer: vk::Buffer,
-    allocation: vk_mem::Allocation,
-}
-
-impl Buffer {
-    fn new(
-        bytes: &[u8],
-        usage: vk::BufferUsageFlags,
-        allocator: &vk_mem::Allocator,
-        queue_family: u32,
-    ) -> anyhow::Result<Self> {
-        let (buffer, allocation, _allocation_info) = allocator.create_buffer(
-            &vk::BufferCreateInfo::builder()
-                .size(bytes.len() as u64)
-                .usage(usage)
-                .queue_family_indices(&[queue_family]),
-            &vk_mem::AllocationCreateInfo {
-                usage: vk_mem::MemoryUsage::GpuOnly,
-                ..Default::default()
-            },
-        )?;
-
-        let pointer = allocator.map_memory(&allocation)?;
-
-        let slice = unsafe { std::slice::from_raw_parts_mut(pointer, bytes.len()) };
-
-        slice.copy_from_slice(bytes);
-
-        allocator.unmap_memory(&allocation)?;
-
-        Ok(Self { buffer, allocation })
-    }
-
-    fn cleanup(&self, allocator: &vk_mem::Allocator) -> anyhow::Result<()> {
-        allocator
-            .destroy_buffer(self.buffer, &self.allocation)
-            .map_err(|err| err.into())
-    }
 }
 
 struct Swapchain {

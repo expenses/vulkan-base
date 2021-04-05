@@ -15,3 +15,11 @@ bytemuck = { version = "1.5.1", features = ["derive"] }
 ultraviolet = { version = "0.8.0", features = ["bytemuck"] }
 vk-mem = "0.2.2"
 winit = "0.24.0"
+
+ash-helpers = { path = "ash-helpers" }
+
+[workspace]
+members = [
+    ".",
+    "ash-helpers"
+]
